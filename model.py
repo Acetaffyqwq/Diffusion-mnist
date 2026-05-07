@@ -58,7 +58,7 @@ class Unet(nn.Module):
         # [n,16,32,32]
         self.convf = nn.Conv2d(D[0], out_dim, 3, padding=1)
 
-    def forward(self, X, t, D=64):
+    def forward(self, X, t):
         X = self.convi(X)
         feats = []
         dep = len(self.enlayers)
@@ -71,8 +71,6 @@ class Unet(nn.Module):
         X = X + t.reshape(X.shape)
         X, _ = self.conmid(X)
 
-        print(X.shape)
-
         for i in range(dep):
             X = self.delayers[i](X, feats[dep - 1 - i])
 
@@ -82,13 +80,13 @@ class Unet(nn.Module):
 class Diffusion(nn.Module):
     def __init__(self, T):
         super().__init__()
-        self.beta = torch.zeros([T])
-        self.alpha = torch.zeros([T])
-        self.Salpha = torch.ones([T])
-        self.sigma = torch.zeros([T])
+        self.register_buffer("beta", torch.zeros([T]))
+        self.register_buffer("alpha", torch.zeros([T]))
+        self.register_buffer("Salpha", torch.ones([T]))
+        self.register_buffer("sigma", torch.zeros([T]))
         for i in range(1, T):
-            self.beta[i] = i / T
-            self.alpha[i] = 1 - i / T
+            self.beta[i] = i / T / 50 # 0~0.02 线性增加
+            self.alpha[i] = 1 - self.beta[i]
             self.Salpha[i] = self.Salpha[i - 1] * self.alpha[i]
             self.sigma[i] = (
                 self.beta[i] * (1 - self.Salpha[i - 1]) / (1 - self.Salpha[i])
@@ -97,25 +95,26 @@ class Diffusion(nn.Module):
         self.unet = Unet(T)
         self.loss_fn = torch.nn.MSELoss()
 
-    def eval(self, XT, t):
-        super().__init__()
+    def step(self, XT, t):
         eps = self.unet(XT, t)
-        mu = 1 / self.sqrt(self.alpha[t])
-        mu = mu * (XT - (1 - self.alpha[t]) / torch.sqrt(1 - self.Salpha[t]) * eps)
+        # 将 [batch] 的数值 reshape 为 [batch,1,1,1]，以便与 [batch,1,32,32] 正确广播
+        alpha_t = self.alpha[t].view(-1, 1, 1, 1)
+        Salpha_t = self.Salpha[t].view(-1, 1, 1, 1)
+        sigma_t = self.sigma[t].view(-1, 1, 1, 1)
 
-        e = torch.randn(mu.shape)
-        return mu + torch.sqrt(self.sigma[t]) * e
+        mu = (1 / torch.sqrt(alpha_t)) * (XT - ((1 - alpha_t) / torch.sqrt(1 - Salpha_t)) * eps)
+
+        e = torch.randn(mu.shape, device=mu.device)
+        return mu + torch.sqrt(sigma_t) * e
 
     def forward(self, X0, t):
-        # X0: [dim,1,32,32]
-        # t : [dim]
-        # Eps: [dim,1,32,32]
-        Eps = torch.randn(X0.shape)
-        print(X0.shape, t.shape)
-        XT = (
-            torch.sqrt(self.Salpha[t])[-1, ...] * X0
-            + torch.sqrt(1 - self.Salpha[t])[-1, ...] * Eps
-        )
+        # X0: [batch,1,32,32]
+        # t : [batch]
+        # Eps: [batch,1,32,32]
+        Eps = torch.randn(X0.shape, device=X0.device)
+        # 将 [batch] 的数值 reshape 为 [batch,1,1,1]
+        Salpha_t = self.Salpha[t].view(-1, 1, 1, 1)
+        XT = torch.sqrt(Salpha_t) * X0 + torch.sqrt(1 - Salpha_t) * Eps
 
         pred = self.unet(XT, t)
         return self.loss_fn(pred, Eps)
